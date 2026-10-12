@@ -1,248 +1,149 @@
 /** @jsxImportSource @opentui/solid */
 import { MouseButton, TextAttributes, type MouseEvent } from "@opentui/core";
 import { Plugin } from "@opencode/plugin/tui";
-import type { Context as TuiPluginApi } from "@opencode/plugin/tui/context";
-import { createMemo, createSignal, For, onCleanup, Show } from "solid-js";
+import type { Context } from "@opencode/plugin/tui/context";
+import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
 
 const PLUGIN_ID = "opencode-session-switch";
-const SESSION_CACHE_TTL_MS = 10_000;
-const SESSION_FETCH_TIMEOUT_MS = 5_000;
-const SESSION_LIST_LIMIT = 50;
 const SWITCH_GUARD_MS = 350;
 const SESSION_LIST_MAX_HEIGHT = 12;
+const SESSION_FETCH_LIMIT = 30;
+const RECENT_LIMIT = 8;
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL_MS = 80;
 
 interface SessionView {
   id: string;
   title: string;
-  created: number;
   updated: number;
-  current: boolean;
 }
 
-interface SessionListResult {
-  data?: unknown;
-  error?: unknown;
+interface Tab {
+  sessionID: string;
 }
-
-type SessionEventName = "session.created" | "session.renamed" | "session.deleted";
-type SessionStatusLabel = "busy" | "retry" | "idle";
-
-let cachedSessions: SessionView[] = [];
-let cachedAt = 0;
-let cacheDirty = true;
-let refreshPromise: Promise<SessionView[]> | undefined;
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
 }
 
-function numberValue(value: unknown): number | undefined {
-  return typeof value === "number" ? value : undefined;
-}
-
-function sessionArray(value: unknown): unknown[] | undefined {
-  if (Array.isArray(value)) {
-    return value;
-  }
-
-  const result = asRecord(value) as SessionListResult | undefined;
-  if (!result || result.error) {
-    return undefined;
-  }
-
-  if (Array.isArray(result.data)) {
-    return result.data;
-  }
-
-  const data = asRecord(result.data);
-  if (Array.isArray(data?.sessions)) {
-    return data.sessions;
-  }
-
-  if (Array.isArray(data?.items)) {
-    return data.items;
-  }
-
-  return undefined;
-}
-
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | undefined> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<undefined>((resolve) => {
-    timer = setTimeout(() => resolve(undefined), timeoutMs);
-  });
-  promise.then(
-    () => timer && clearTimeout(timer),
-    () => timer && clearTimeout(timer),
-  );
-
-  return Promise.race([promise, timeout]);
-}
-
 function toSessionView(value: unknown): SessionView | undefined {
   const session = asRecord(value);
-  if (!session || typeof session.id !== "string") {
-    return undefined;
-  }
+  if (!session || typeof session.id !== "string") return;
 
   const parentID = session.parentID ?? session.parentId;
-  if (typeof parentID === "string" && parentID.trim()) {
-    return undefined;
-  }
+  if (typeof parentID === "string" && parentID.trim()) return;
 
   const time = asRecord(session.time);
-  const created = numberValue(time?.created) ?? numberValue(session.created) ?? 0;
-  const updated = numberValue(time?.updated) ?? numberValue(session.updated) ?? created;
-  const title = typeof session.title === "string" && session.title.trim() ? session.title.trim() : "Untitled session";
+  const created = typeof time?.created === "number" ? time.created : 0;
+  const updated = typeof time?.updated === "number" ? time.updated : created;
+  if (typeof time?.archived === "number") return;
+  const viewed = typeof time?.viewed === "number" ? time.viewed : 0;
   return {
     id: session.id,
-    title,
-    created,
-    updated,
-    current: false,
+    title: typeof session.title === "string" && session.title.trim() ? session.title.trim() : "Untitled session",
+    updated: Math.max(updated, viewed),
   };
+}
+
+/** Open tabs first, in tab order, then the most recently used sessions, capped at RECENT_LIMIT. */
+export function orderSessions(sessions: SessionView[], tabs: readonly Tab[], currentID: string): SessionView[] {
+  const byID = new Map(sessions.map((session) => [session.id, session]));
+  const open = tabs.map((tab) => byID.get(tab.sessionID)).filter((session): session is SessionView => Boolean(session));
+  const openIDs = new Set(open.map((session) => session.id));
+  const recent = sessions
+    .filter((session) => !openIDs.has(session.id))
+    .sort((left, right) => right.updated - left.updated)
+    .slice(0, RECENT_LIMIT);
+  // Keep the session in view listed even when it is older than the recent ones.
+  const current = byID.get(currentID);
+  if (current && !openIDs.has(currentID) && !recent.includes(current)) recent.push(current);
+  return [...open, ...recent];
+}
+
+function age(time: number): string {
+  const minutes = Math.floor((Date.now() - time) / 60_000);
+  if (minutes < 60) return `${Math.max(minutes, 1)}m`;
+  if (minutes < 24 * 60) return `${Math.floor(minutes / 60)}h`;
+  return `${Math.floor(minutes / (24 * 60))}d`;
 }
 
 function shortTitle(title: string): string {
   return title.length > 26 ? `${title.slice(0, 25)}...` : title;
 }
 
-function sortSessions(left: SessionView, right: SessionView): number {
-  const title = left.title.localeCompare(right.title, undefined, { sensitivity: "base" });
-  if (title !== 0) {
-    return title;
-  }
-
-  return left.id.localeCompare(right.id);
-}
-
-function getSessionStatus(api: TuiPluginApi, sessionID: string): SessionStatusLabel {
-  return api.data.session.status(sessionID) === "running" ? "busy" : "idle";
-}
-
-function spinnerFrame(index: number): string {
-  return SPINNER_FRAMES[index % SPINNER_FRAMES.length] ?? SPINNER_FRAMES[0]!;
-}
-
-function withCurrentSession(sessions: SessionView[], currentSessionID: string): SessionView[] {
-  return sessions.map((session) => ({
-    ...session,
-    current: session.id === currentSessionID,
-  }));
-}
-
-async function fetchRecentSessions(api: TuiPluginApi): Promise<SessionView[]> {
-  let result: unknown;
-  try {
-    result = await withTimeout(api.client.session.list({ parentID: null, limit: SESSION_LIST_LIMIT }), SESSION_FETCH_TIMEOUT_MS);
-  } catch {
-    return cachedSessions;
-  }
-
-  const data = sessionArray(result);
-  if (!data) {
-    return cachedSessions;
-  }
-
-  cachedSessions = data
-    .map(toSessionView)
-    .filter((session): session is SessionView => Boolean(session))
-    .sort(sortSessions);
-  cachedAt = Date.now();
-  cacheDirty = false;
-
-  return cachedSessions;
-}
-
-function getCachedSessions(currentSessionID: string): SessionView[] {
-  return withCurrentSession(cachedSessions, currentSessionID);
-}
-
-function shouldRefreshSessions(): boolean {
-  return cacheDirty || cachedSessions.length === 0 || Date.now() - cachedAt > SESSION_CACHE_TTL_MS;
-}
-
-async function refreshRecentSessions(api: TuiPluginApi, currentSessionID: string): Promise<SessionView[]> {
-  refreshPromise ??= fetchRecentSessions(api).finally(() => {
-    refreshPromise = undefined;
-  });
-
-  return withCurrentSession(await refreshPromise, currentSessionID);
-}
-
 function clickPrimary(event: MouseEvent): boolean {
-  if (event.button !== MouseButton.LEFT) {
-    return false;
-  }
-
+  if (event.button !== MouseButton.LEFT) return false;
   event.preventDefault();
   event.stopPropagation();
   return true;
 }
 
-function switchSession(api: TuiPluginApi, sessionID: string): void {
-  try {
-    api.ui.router.navigate({ type: "session", sessionID });
-  } catch {
-    api.ui.toast.show({ message: "Failed to switch session", variant: "error", duration: 2500 });
-  }
-}
-
-function SidebarSessionSwitch(props: { api: TuiPluginApi; sessionID: string }) {
-  const theme = props.api.theme;
-  const [sessions, setSessions] = createSignal<SessionView[]>(getCachedSessions(props.sessionID));
-  const [loading, setLoading] = createSignal(cachedSessions.length === 0);
+function SidebarSessionSwitch(props: { context: Context; sessionID: string }) {
+  const theme = props.context.theme;
+  const [sessions, setSessions] = createSignal<SessionView[]>([]);
+  const [loading, setLoading] = createSignal(true);
   const [expanded, setExpanded] = createSignal(true);
-  const [switchingSessionID, setSwitchingSessionID] = createSignal<string | undefined>();
+  const [switchingSessionID, setSwitchingSessionID] = createSignal<string>();
   const [spinnerIndex, setSpinnerIndex] = createSignal(0);
-  const visibleSessions = createMemo(() => withCurrentSession(sessions(), props.sessionID));
+  let refreshing: Promise<void> | undefined;
 
-  const refresh = async (force = false) => {
-    if (!force && !shouldRefreshSessions()) {
-      setSessions(getCachedSessions(props.sessionID));
-      setLoading(false);
-      return;
-    }
+  // Only sessions from the directory of the session in view; /sessions browses the full history.
+  const directory = async () =>
+    props.context.data.session.get(props.sessionID)?.location.directory ??
+    (await props.context.client.session.get({ sessionID: props.sessionID }).catch(() => undefined))?.location.directory ??
+    props.context.location?.directory;
 
-    setLoading(cachedSessions.length === 0);
-    try {
-      setSessions(await refreshRecentSessions(props.api, props.sessionID));
-    } catch {
-      setSessions(getCachedSessions(props.sessionID));
-    } finally {
-      setLoading(false);
-    }
+  const refresh = async () => {
+    refreshing ??= directory()
+      .then((dir) => props.context.client.session.list({ parentID: null, directory: dir, limit: SESSION_FETCH_LIMIT, order: "desc" }))
+      .then((result) => {
+        setSessions(result.data.map(toSessionView).filter((session): session is SessionView => Boolean(session)));
+      })
+      .catch(() => {
+        props.context.ui.toast.show({ message: "Failed to load sessions", variant: "error", duration: 2500 });
+      })
+      .finally(() => {
+        refreshing = undefined;
+        setLoading(false);
+      });
+    return refreshing;
   };
 
-  const selectSession = (sessionID: string) => {
-    if (switchingSessionID() || sessionID === props.sessionID) {
-      return;
-    }
+  const tabs = () => (props.context.ui.tabs.enabled() ? props.context.ui.tabs.list() : []);
+  const ordered = createMemo(() => orderSessions(sessions(), tabs(), props.sessionID));
+  const isOpen = (sessionID: string) => tabs().some((tab) => tab.sessionID === sessionID);
 
-    setSwitchingSessionID(sessionID);
-    switchSession(props.api, sessionID);
-    setTimeout(() => setSwitchingSessionID(undefined), SWITCH_GUARD_MS);
-  };
+  // Re-scope the list when the sidebar follows a switch to another session.
+  createEffect(() => {
+    void props.sessionID;
+    void refresh();
+  });
+  const stopCreated = props.context.data.on("session.created", () => void refresh());
+  const stopRenamed = props.context.data.on("session.renamed", () => void refresh());
+  const stopDeleted = props.context.data.on("session.deleted", () => void refresh());
+  const stopIdle = props.context.data.on("session.idle", () => void refresh());
+  const spinnerTimer = setInterval(() => setSpinnerIndex((index) => index + 1), SPINNER_INTERVAL_MS);
+  const switchTimers = new Set<ReturnType<typeof setTimeout>>();
 
-  void refresh();
-
-  const spinnerTimer = setInterval(() => {
-    setSpinnerIndex((index) => index + 1);
-  }, SPINNER_INTERVAL_MS);
-
-  const sessionEvents: SessionEventName[] = ["session.created", "session.renamed", "session.deleted"];
-  const disposers = sessionEvents.map((event) =>
-    props.api.data.on(event, () => {
-      cacheDirty = true;
-      void refresh(true);
-    }),
-  );
   onCleanup(() => {
     clearInterval(spinnerTimer);
-    disposers.forEach((dispose) => dispose());
+    switchTimers.forEach(clearTimeout);
+    stopCreated();
+    stopRenamed();
+    stopDeleted();
+    stopIdle();
   });
+
+  const selectSession = (sessionID: string) => {
+    if (switchingSessionID() || sessionID === props.sessionID) return;
+    setSwitchingSessionID(sessionID);
+    if (!props.context.ui.tabs.focus(sessionID)) props.context.ui.router.navigate({ type: "session", sessionID });
+    const timer = setTimeout(() => {
+      switchTimers.delete(timer);
+      setSwitchingSessionID(undefined);
+    }, SWITCH_GUARD_MS);
+    switchTimers.add(timer);
+  };
 
   return (
     <box flexDirection="column" gap={0} paddingTop={1} paddingBottom={1}>
@@ -251,47 +152,45 @@ function SidebarSessionSwitch(props: { api: TuiPluginApi; sessionID: string }) {
         gap={1}
         alignItems="center"
         onMouseUp={(event) => {
-          if (clickPrimary(event)) {
-            setExpanded((value) => !value);
-          }
+          if (clickPrimary(event)) setExpanded((value) => !value);
         }}
       >
         <text fg={theme.text.base}>{expanded() ? "▼" : "▶"}</text>
-        <text fg={theme.text.base} attributes={TextAttributes.BOLD}>
-          Sessions
-        </text>
+        <text fg={theme.text.base} attributes={TextAttributes.BOLD}>Sessions</text>
       </box>
 
       <Show when={expanded()}>
         <Show when={!loading()} fallback={<text fg={theme.text.muted}>  Loading sessions...</text>}>
-          <Show when={visibleSessions().length > 0} fallback={<text fg={theme.text.muted}>  No other recent sessions</text>}>
+          <Show when={ordered().length > 0} fallback={<text fg={theme.text.muted}>  No other recent sessions</text>}>
             <scrollbox maxHeight={SESSION_LIST_MAX_HEIGHT}>
               <box flexDirection="column" gap={0}>
-                <For each={visibleSessions()}>
+                <For each={ordered()}>
                   {(session) => {
-                    const status = () => getSessionStatus(props.api, session.id);
+                    const running = () => props.context.data.session.status(session.id) === "running";
+                    const current = () => session.id === props.sessionID;
                     return (
                       <box
                         flexDirection="row"
+                        justifyContent="space-between"
                         gap={1}
                         onMouseUp={(event) => {
-                          if (clickPrimary(event)) {
-                            selectSession(session.id);
-                          }
+                          if (clickPrimary(event)) selectSession(session.id);
                         }}
                       >
-                        <text fg={session.current || switchingSessionID() === session.id ? theme.text.action.primary.base : theme.text.base}>
+                        <text
+                          fg={
+                            current() || switchingSessionID() === session.id
+                              ? theme.text.action.primary.base
+                              : theme.text.base
+                          }
+                        >
                           {`  ${shortTitle(session.title)}`}
                         </text>
                         <Show
-                          when={status() === "busy"}
-                          fallback={
-                            <Show when={status() === "retry"}>
-                              <text fg={theme.text.feedback.warning.base}>retry</text>
-                            </Show>
-                          }
+                          when={running()}
+                          fallback={<text fg={theme.text.muted}>{isOpen(session.id) ? "open" : age(session.updated)}</text>}
                         >
-                          <text fg={theme.text.muted}>{spinnerFrame(spinnerIndex())}</text>
+                          <text fg={theme.text.muted}>{SPINNER_FRAMES[spinnerIndex() % SPINNER_FRAMES.length]}</text>
                         </Show>
                       </box>
                     );
@@ -308,10 +207,10 @@ function SidebarSessionSwitch(props: { api: TuiPluginApi; sessionID: string }) {
 
 export default Plugin.define({
   id: PLUGIN_ID,
-  setup(api) {
-    return api.ui.slot({
+  setup(context) {
+    return context.ui.slot({
       append: "sidebar.content",
-      render: (props) => <SidebarSessionSwitch api={api} sessionID={props.sessionID} />,
+      render: (props) => <SidebarSessionSwitch context={context} sessionID={props.sessionID} />,
     });
   },
 });

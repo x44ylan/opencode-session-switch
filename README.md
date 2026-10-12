@@ -42,10 +42,12 @@ Reload or restart OpenCode after changing plugin config.
 ## Use It
 
 - Sidebar: expand `Sessions` and click a session name to switch to it.
+- The list shows sessions from the current session's directory only: open tabs first, then the 8 most recently used. A spinner marks running sessions; the others show `open` or how long ago they were used.
+- Use `/sessions` for the full history.
 
 ## Notes
 
-The sidebar uses OpenCode's TUI route API for direct session switching.
+Switching focuses the session's tab when it is open, and otherwise navigates with OpenCode's TUI router.
 
 ## License
 
